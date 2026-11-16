@@ -1,5 +1,4 @@
-﻿// Assignment2 – Debugging.cpp : This file contains the 'main' function. Program execution begins and ends there.
-//
+﻿// Assignment #2 – Debugging vs. Release Coding Practice
 
 #include <iostream>
 #include <fstream>
@@ -71,9 +70,15 @@ int main()
         string firstName;
         string email;
 
+        int unusedCounter = 0;
+
         stringstream ss(line);
 
 #ifdef PRE_RELEASE
+
+        getline(ss, lastName, ',');
+        getline(ss, firstName, ',');
+        getline(ss, email);
 
         getline(ss, lastName, ',');
         getline(ss, firstName, ',');
@@ -86,7 +91,7 @@ int main()
 
         if (!firstName.empty() && firstName[0] == ' ')
         {
-            firstName.erase(0, 1);
+            firstName.erase(0, 5);
         }
 
         STUDENT_DATA student;

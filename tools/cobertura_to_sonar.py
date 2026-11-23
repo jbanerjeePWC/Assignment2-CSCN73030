@@ -11,14 +11,18 @@ import xml.etree.ElementTree as ET
 
 
 def to_repo_relative(path, root):
-    path = os.path.normpath(path)
-    try:
-        rel = os.path.relpath(path, root)
-    except ValueError:  # different drive on Windows
-        return path.replace("\\", "/")
-    if rel.startswith(".."):
-        return path.replace("\\", "/")
-    return rel.replace("\\", "/")
+    """Map a path from the coverage report to a repo-relative path SonarQube can match.
+
+    OpenCppCoverage can write Windows paths without the drive letter (for example
+    "a/repo/repo/PrettyPrint.cpp"), so a plain relpath() gives a path that does not
+    exist. Drop leading folders until the remaining path exists under the repo root.
+    """
+    parts = [p for p in path.replace("\\", "/").split("/") if p and not p.endswith(":")]
+    for i in range(len(parts)):
+        candidate = "/".join(parts[i:])
+        if os.path.isfile(os.path.join(root, candidate)):
+            return candidate
+    return None
 
 
 def convert(src, dst, root):
@@ -35,11 +39,15 @@ def convert(src, dst, root):
             name = cls.get("filename")
             if not name:
                 continue
-            full = name
-            if not os.path.isabs(full):
-                base = sources[0] if sources else root
-                full = os.path.join(base, name)
-            rel = to_repo_relative(full, root)
+            rel = to_repo_relative(name, root)
+            if rel is None:
+                for base in sources:  # fall back to the report's <source> roots
+                    rel = to_repo_relative(os.path.join(base, name), root)
+                    if rel:
+                        break
+            if rel is None:
+                print(f"warning: {name} not found under {root}; skipped")
+                continue
             lines = files.setdefault(rel, {})
             for line in cls.iter("line"):
                 number = int(line.get("number"))

@@ -1,0 +1,93 @@
+name: SonarQube Cloud
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-scan:
+    # Pinned to Windows Server 2022 (Visual Studio 2022, toolset v143, which the x64 projects use).
+    # "windows-latest" has been moving between Visual Studio versions.
+    runs-on: windows-2022
+    env:
+      BUILD_WRAPPER_OUT_DIR: bw-output
+      CONFIGURATION: Debug
+      PLATFORM: x64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history gives SonarQube Cloud better new-code detection
+
+      - name: Install SonarQube build wrapper
+        uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v6
+
+      # C++ analysis needs the compiler commands, so the build runs under the build wrapper.
+      # PrettyPrintTest.vcxproj references the console app project, so both are built.
+      - name: Build (under build wrapper)
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+          Write-Host "MSBuild: $msbuild"
+          build-wrapper-win-x86-64 --out-dir $env:BUILD_WRAPPER_OUT_DIR $msbuild PrettyPrintTest\PrettyPrintTest.vcxproj /t:Rebuild /p:Configuration=$env:CONFIGURATION /p:Platform=$env:PLATFORM /nologo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install OpenCppCoverage
+        run: choco install opencppcoverage -y --no-progress
+
+      # Runs the CppUnitTest DLL through vstest.console, wrapped by OpenCppCoverage.
+      - name: Run unit tests with coverage
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vstest = & $vswhere -latest -products * -find "Common7\IDE\CommonExtensions\Microsoft\TestWindow\vstest.console.exe" | Select-Object -First 1
+          $dll = Get-ChildItem -Recurse -Filter PrettyPrintTest.dll | Where-Object { $_.FullName -match "\\$env:PLATFORM\\$env:CONFIGURATION\\" } | Select-Object -First 1
+          if (-not $dll) { throw "PrettyPrintTest.dll was not built" }
+          Write-Host "vstest: $vstest"
+          Write-Host "Test DLL: $($dll.FullName)"
+          & "C:\Program Files\OpenCppCoverage\OpenCppCoverage.exe" `
+            --modules PrettyPrintTest.dll `
+            --sources "$PWD\PrettyPrint.cpp" `
+            --export_type "cobertura:coverage-cobertura.xml" `
+            -- $vstest $dll.FullName /Platform:$env:PLATFORM "/Logger:trx;LogFileName=test-results.trx" "/Logger:console;verbosity=normal"
+          Write-Host "OpenCppCoverage exit code: $LASTEXITCODE"
+
+      # OpenCppCoverage may not propagate a failing test result, so read the .trx directly.
+      - name: Check test results
+        run: |
+          $trx = Get-ChildItem -Recurse -Filter test-results.trx | Select-Object -First 1
+          if (-not $trx) { throw "No test result file was produced" }
+          [xml]$x = Get-Content $trx.FullName
+          $c = $x.TestRun.ResultSummary.Counters
+          Write-Host "Total=$($c.total) Passed=$($c.passed) Failed=$($c.failed)"
+          if ([int]$c.failed -gt 0 -or [int]$c.total -eq 0) { throw "Unit tests failed or none ran" }
+
+      # Always produces sonar-coverage.xml (empty if there is no coverage) so the scan never breaks on a missing file.
+      - name: Convert coverage to SonarQube generic format
+        if: ${{ !cancelled() }}
+        run: python tools/cobertura_to_sonar.py coverage-cobertura.xml sonar-coverage.xml
+
+      # Runs even when tests failed, so a failing test never silently skips the analysis
+      # (the job still ends red because the test step failed).
+      - name: SonarQube Cloud scan
+        if: ${{ !cancelled() }}
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.cfamily.compile-commands=${{ env.BUILD_WRAPPER_OUT_DIR }}/compile_commands.json
+
+      - name: Upload test and coverage evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-and-coverage-evidence
+          path: |
+            **/test-results.trx
+            coverage-cobertura.xml
+            sonar-coverage.xml
+          if-no-files-found: warn
